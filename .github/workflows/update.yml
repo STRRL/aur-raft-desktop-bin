@@ -1,0 +1,85 @@
+name: update
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Run the update and build but do not push anything
+        type: boolean
+        default: false
+
+concurrency:
+  group: update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install tools
+        run: |
+          pacman -Syu --noconfirm --needed git openssh
+
+      - uses: actions/checkout@v4
+
+      - name: Prepare build user
+        run: |
+          git config --global --add safe.directory '*'
+          useradd -m builder
+          chown -R builder "$GITHUB_WORKSPACE"
+
+      - name: Update PKGBUILD and test build
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          runuser -u builder -- env GITHUB_TOKEN="$GITHUB_TOKEN" bash update.sh
+
+      - name: Detect new version
+        id: version
+        run: |
+          if git diff --quiet -- PKGBUILD .SRCINFO; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "pkgver=$(grep -oP '^pkgver=\K.*' PKGBUILD)" >> "$GITHUB_OUTPUT"
+            git --no-pager diff -- PKGBUILD
+          fi
+
+      - name: Push to AUR
+        if: steps.version.outputs.changed == 'true' && inputs.dry_run != true
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          PKGVER: ${{ steps.version.outputs.pkgver }}
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          echo 'aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN' > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND='ssh -i ~/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=~/.ssh/known_hosts'
+
+          git clone ssh://aur@aur.archlinux.org/raft-desktop-bin.git /tmp/aur
+          cp PKGBUILD .SRCINFO /tmp/aur/
+          cd /tmp/aur
+          git add PKGBUILD .SRCINFO
+          if git diff --cached --quiet; then
+            echo "AUR already has this version"
+            exit 0
+          fi
+          git -c user.name='Zhiqiang ZHOU' -c user.email='im@strrl.dev' commit -m "Update to $PKGVER"
+          git push origin HEAD:master
+
+      - name: Push to GitHub
+        if: steps.version.outputs.changed == 'true' && inputs.dry_run != true
+        env:
+          PKGVER: ${{ steps.version.outputs.pkgver }}
+        run: |
+          git add PKGBUILD .SRCINFO
+          git -c user.name='Zhiqiang ZHOU' -c user.email='im@strrl.dev' commit -m "Update to $PKGVER"
+          git push origin HEAD:${{ github.ref_name }}
